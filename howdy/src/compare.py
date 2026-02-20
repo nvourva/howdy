@@ -39,9 +39,65 @@ def exit(code=None):
 		sys.exit(code)
 
 
+def eye_aspect_ratio(eye):
+	"""Compute the eye aspect ratio for blink detection."""
+	vertical_1 = np.linalg.norm(eye[1] - eye[5])
+	vertical_2 = np.linalg.norm(eye[2] - eye[4])
+	horizontal = np.linalg.norm(eye[0] - eye[3])
+	return (vertical_1 + vertical_2) / (2.0 * horizontal)
+
+
+def detect_blink(shape):
+	"""Detect blink using 68-point facial landmarks."""
+	global blink_counter, blink_state, ear_history
+	
+	left_eye = np.array([(shape.part(i).x, shape.part(i).y) for i in range(36, 42)])
+	right_eye = np.array([(shape.part(i).x, shape.part(i).y) for i in range(42, 48)])
+	
+	left_ear = eye_aspect_ratio(left_eye)
+	right_ear = eye_aspect_ratio(right_eye)
+	ear = (left_ear + right_ear) / 2.0
+	
+	ear_history.append(ear)
+	if len(ear_history) > 10:
+		ear_history.pop(0)
+	
+	if ear < EYE_AR_THRESH:
+		if not blink_state:
+			blink_state = True
+			blink_counter += 1
+	else:
+		blink_state = False
+	
+	return blink_counter, ear
+
+
+def detect_ir_camera(video_capture):
+	"""Attempt to detect if camera is IR-capable."""
+	try:
+		frame, gsframe = video_capture.read_frame()
+		if frame is None:
+			return False, None
+		
+		gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+		
+		mean_brightness = np.mean(gray)
+		std_brightness = np.std(gray)
+		
+		is_likely_ir = mean_brightness < 80 or std_brightness < 30
+		
+		return is_likely_ir, {
+			"mean_brightness": mean_brightness,
+			"std_brightness": std_brightness,
+			"is_likely_ir": is_likely_ir
+		}
+	except Exception:
+		return False, None
+
+
 def init_detector(lock):
 	"""Start face detector, encoder and predictor in a new thread"""
-	global face_detector, pose_predictor, face_encoder
+	global face_detector, pose_predictor, pose_predictor_68, face_encoder
 
 	# Test if at lest 1 of the data files is there and abort if it's not
 	if not os.path.isfile(paths_factory.shape_predictor_5_face_landmarks_path()):
@@ -60,6 +116,11 @@ def init_detector(lock):
 	# Start the others regardless
 	pose_predictor = dlib.shape_predictor(paths_factory.shape_predictor_5_face_landmarks_path())
 	face_encoder = dlib.face_recognition_model_v1(paths_factory.dlib_face_recognition_resnet_model_v1_path())
+
+	# Load 68-point predictor for liveness detection if available
+	predictor_68_path = paths_factory.shape_predictor_68_face_landmarks_path()
+	if os.path.isfile(predictor_68_path):
+		pose_predictor_68 = dlib.shape_predictor(predictor_68_path)
 
 	# Note the time it took to initialize detectors
 	timings["ll"] = time.time() - timings["ll"]
@@ -119,7 +180,15 @@ lowest_certainty = 10
 # Face recognition/detection instances
 face_detector = None
 pose_predictor = None
+pose_predictor_68 = None
 face_encoder = None
+
+# Liveness detection state
+blink_counter = 0
+blink_state = False
+ear_history = []
+EYE_AR_THRESH = 0.2
+EYE_AR_CONSEC_FRAMES = 3
 
 # Try to load the face model from the models folder
 try:
@@ -148,6 +217,15 @@ save_failed = config.getboolean("snapshots", "save_failed", fallback=False)
 save_successful = config.getboolean("snapshots", "save_successful", fallback=False)
 gtk_stdout = config.getboolean("debug", "gtk_stdout", fallback=False)
 rotate = config.getint("video", "rotate", fallback=0)
+
+# Liveness detection config
+liveness_enabled = config.getboolean("liveness", "enabled", fallback=True)
+liveness_blinks_required = config.getint("liveness", "blinks_required", fallback=1)
+liveness_timeout = config.getfloat("liveness", "timeout", fallback=2.0)
+
+# IR camera validation config
+ir_enforce = config.getboolean("video", "ir_enforce", fallback=False)
+ir_warn = config.getboolean("video", "ir_warn", fallback=True)
 
 # Send the gtk output to the terminal if enabled in the config
 gtk_pipe = sys.stdout if gtk_stdout else subprocess.DEVNULL
@@ -188,6 +266,21 @@ timings["ic"] = time.time() - timings["ic"]
 lock.acquire()
 lock.release()
 del lock
+
+# IR camera detection and validation
+ir_info = None
+if ir_enforce or ir_warn:
+	is_ir, ir_info = detect_ir_camera(video_capture)
+	if ir_info:
+		if ir_enforce and not is_ir:
+			print(_("IR camera enforcement enabled but no IR camera detected"))
+			print(_("Camera stats: mean_brightness={:.1f}, std_brightness={:.1f}").format(
+				ir_info["mean_brightness"], ir_info["std_brightness"]))
+			exit(14)
+		elif ir_warn and not is_ir:
+			print(_("WARNING: No IR camera detected. Face recognition may be vulnerable to photo attacks."))
+			print(_("Camera stats: mean_brightness={:.1f}, std_brightness={:.1f}").format(
+				ir_info["mean_brightness"], ir_info["std_brightness"]))
 
 # Fetch the max frame height
 max_height = config.getfloat("video", "max_height", fallback=320.0)
@@ -308,6 +401,16 @@ while True:
 		# Fetch the faces in the image
 		face_landmark = pose_predictor(frame, fl)
 		face_encoding = np.array(face_encoder.compute_face_descriptor(frame, face_landmark, 1))
+
+		# Liveness detection via blink detection
+		if liveness_enabled and pose_predictor_68 is not None:
+			face_landmark_68 = pose_predictor_68(frame, fl)
+			blinks, ear = detect_blink(face_landmark_68)
+			
+			if blinks < liveness_blinks_required:
+				if end_report and frames % 10 == 0:
+					print(_("Liveness check: {} blinks detected, {} required").format(blinks, liveness_blinks_required))
+				continue
 
 		# Match this found face against a known face
 		matches = np.linalg.norm(encodings - face_encoding, axis=1)

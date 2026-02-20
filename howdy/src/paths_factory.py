@@ -3,6 +3,7 @@ import paths
 
 models = [
     "shape_predictor_5_face_landmarks.dat",
+    "shape_predictor_68_face_landmarks.dat",
     "mmod_human_face_detector.dat",
     "dlib_face_recognition_resnet_model_v1.dat",
 ]
@@ -16,12 +17,16 @@ def shape_predictor_5_face_landmarks_path() -> str:
     return str(paths.dlib_data_dir / models[0])
 
 
-def mmod_human_face_detector_path() -> str:
+def shape_predictor_68_face_landmarks_path() -> str:
     return str(paths.dlib_data_dir / models[1])
 
 
-def dlib_face_recognition_resnet_model_v1_path() -> str:
+def mmod_human_face_detector_path() -> str:
     return str(paths.dlib_data_dir / models[2])
+
+
+def dlib_face_recognition_resnet_model_v1_path() -> str:
+    return str(paths.dlib_data_dir / models[3])
 
 
 def user_model_path(user: str) -> str:

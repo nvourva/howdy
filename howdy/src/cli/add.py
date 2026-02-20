@@ -114,93 +114,161 @@ insert_model = {
 # Set up video_capture
 video_capture = VideoCapture(config)
 
-print(_("\nPlease look straight into the camera"))
-
-# Give the user time to read
-time.sleep(2)
-
-# Will contain found face encodings
-enc = []
-# Count the number of read frames
-frames = 0
-# Count the number of illuminated read frames
-valid_frames = 0
-# Count the number of illuminated frames that
-# were rejected for being too dark
-dark_tries = 0
-# Track the running darkness total
-dark_running_total = 0
-face_locations = None
-
 dark_threshold = config.getfloat("video", "dark_threshold", fallback=60)
+multi_angle = config.getboolean("video", "multi_angle_enrollment", fallback=True)
 
 clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
-# Loop through frames till we hit a timeout
-while frames < 60:
-	frames += 1
-	# Grab a single frame of video
-	frame, gsframe = video_capture.read_frame()
-	gsframe = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-	gsframe = clahe.apply(gsframe)
+# Define angles for multi-angle enrollment
+angles = [
+	("straight ahead", None),
+	("slightly left", "left"),
+	("slightly right", "right"),
+	("slightly up", "up"),
+	("slightly down", "down")
+]
 
-	# Create a histogram of the image with 8 values
-	hist = cv2.calcHist([gsframe], [0], None, [8], [0, 256])
-	# All values combined for percentage calculation
-	hist_total = np.sum(hist)
+if multi_angle:
+	print(_("\nMulti-angle enrollment enabled."))
+	print(_("Please position your face at different angles as prompted."))
+	time.sleep(2)
+else:
+	print(_("\nPlease look straight into the camera"))
+	time.sleep(2)
 
-	# Calculate frame darkness
-	darkness = (hist[0] / hist_total * 100)
 
-	# If the image is fully black due to a bad camera read,
-	# skip to the next frame
-	if (hist_total == 0) or (darkness == 100):
-		continue
+def capture_face_encoding(video_capture, prompt_text, angle_hint=None):
+	"""Capture a single face encoding with the given prompt."""
+	global frames, valid_frames, dark_tries, dark_running_total
+	
+	print(_("\nPlease look {}").format(prompt_text))
+	if angle_hint:
+		print(_("Turn your head {}").format(angle_hint))
+	time.sleep(1)
+	
+	frames = 0
+	valid_frames = 0
+	dark_tries = 0
+	dark_running_total = 0
+	face_locations = None
+	
+	while frames < 60:
+		frames += 1
+		frame, gsframe = video_capture.read_frame()
+		gsframe = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+		gsframe = clahe.apply(gsframe)
+		
+		hist = cv2.calcHist([gsframe], [0], None, [8], [0, 256])
+		hist_total = np.sum(hist)
+		darkness = (hist[0] / hist_total * 100)
+		
+		if (hist_total == 0) or (darkness == 100):
+			continue
+		
+		dark_running_total += darkness
+		valid_frames += 1
+		
+		if (darkness > dark_threshold):
+			dark_tries += 1
+			continue
+		
+		face_locations = face_detector(gsframe, 1)
+		
+		if face_locations:
+			break
+	
+	if not face_locations:
+		if valid_frames == 0:
+			print(_("Camera saw only black frames - is IR emitter working?"))
+		elif valid_frames == dark_tries:
+			print(_("All frames were too dark, please check dark_threshold in config"))
+		else:
+			print(_("No face detected for {} angle, skipping").format(prompt_text))
+		return None
+	
+	if len(face_locations) > 1:
+		print(_("Multiple faces detected for {} angle, skipping").format(prompt_text))
+		return None
+	
+	face_location = face_locations[0]
+	if use_cnn:
+		face_location = face_location.rect
+	
+	face_landmark = pose_predictor(frame, face_location)
+	face_encoding = np.array(face_encoder.compute_face_descriptor(frame, face_landmark, 1))
+	
+	print(_("Captured {} angle successfully").format(prompt_text))
+	return face_encoding
 
-	# Include this frame in calculating our average session brightness
-	dark_running_total += darkness
-	valid_frames += 1
 
-	# If the image exceeds darkness threshold due to subject distance,
-	# skip to the next frame
-	if (darkness > dark_threshold):
-		dark_tries += 1
-		continue
-
-	# Get all faces from that frame as encodings
-	face_locations = face_detector(gsframe, 1)
-
-	# If we've found at least one, we can continue
-	if face_locations:
-		break
+if multi_angle:
+	for prompt, hint in angles:
+		encoding = capture_face_encoding(video_capture, prompt, hint)
+		if encoding is not None:
+			insert_model["data"].append(encoding.tolist())
+	
+	if len(insert_model["data"]) == 0:
+		print(_("\nNo face encodings captured from any angle, aborting"))
+		sys.exit(1)
+	
+	print(_("\nCaptured {} face encodings from different angles").format(len(insert_model["data"])))
+else:
+	enc = []
+	frames = 0
+	valid_frames = 0
+	dark_tries = 0
+	dark_running_total = 0
+	face_locations = None
+	
+	while frames < 60:
+		frames += 1
+		frame, gsframe = video_capture.read_frame()
+		gsframe = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+		gsframe = clahe.apply(gsframe)
+		
+		hist = cv2.calcHist([gsframe], [0], None, [8], [0, 256])
+		hist_total = np.sum(hist)
+		darkness = (hist[0] / hist_total * 100)
+		
+		if (hist_total == 0) or (darkness == 100):
+			continue
+		
+		dark_running_total += darkness
+		valid_frames += 1
+		
+		if (darkness > dark_threshold):
+			dark_tries += 1
+			continue
+		
+		face_locations = face_detector(gsframe, 1)
+		
+		if face_locations:
+			break
+	
+	if not face_locations:
+		if valid_frames == 0:
+			print(_("Camera saw only black frames - is IR emitter working?"))
+		elif valid_frames == dark_tries:
+			print(_("All frames were too dark, please check dark_threshold in config"))
+			print(_("Average darkness: {avg}, Threshold: {threshold}").format(avg=str(dark_running_total / valid_frames), threshold=str(dark_threshold)))
+		else:
+			print(_("No face detected, aborting"))
+		sys.exit(1)
+	
+	if len(face_locations) > 1:
+		print(_("Multiple faces detected, aborting"))
+		sys.exit(1)
+	
+	face_location = face_locations[0]
+	if use_cnn:
+		face_location = face_location.rect
+	
+	face_landmark = pose_predictor(frame, face_location)
+	face_encoding = np.array(face_encoder.compute_face_descriptor(frame, face_landmark, 1))
+	
+	insert_model["data"].append(face_encoding.tolist())
 
 video_capture.release()
-
-# If we've found no faces, try to determine why
-if not face_locations:
-	if valid_frames == 0:
-		print(_("Camera saw only black frames - is IR emitter working?"))
-	elif valid_frames == dark_tries:
-		print(_("All frames were too dark, please check dark_threshold in config"))
-		print(_("Average darkness: {avg}, Threshold: {threshold}").format(avg=str(dark_running_total / valid_frames), threshold=str(dark_threshold)))
-	else:
-		print(_("No face detected, aborting"))
-	sys.exit(1)
-
-# If more than 1 faces are detected we can't know which one belongs to the user
-elif len(face_locations) > 1:
-	print(_("Multiple faces detected, aborting"))
-	sys.exit(1)
-
-face_location = face_locations[0]
-if use_cnn:
-	face_location = face_location.rect
-
-# Get the encodings in the frame
-face_landmark = pose_predictor(frame, face_location)
-face_encoding = np.array(face_encoder.compute_face_descriptor(frame, face_landmark, 1))
-
-insert_model["data"].append(face_encoding.tolist())
 
 # Insert full object into the list
 encodings.append(insert_model)
