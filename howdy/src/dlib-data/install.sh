@@ -13,6 +13,7 @@ if hash wget;then
 	wget $_PROGRESS_OPT --tries 5 https://github.com/davisking/dlib-models/raw/master/mmod_human_face_detector.dat.bz2
 	wget $_PROGRESS_OPT --tries 5 https://github.com/davisking/dlib-models/raw/master/shape_predictor_5_face_landmarks.dat.bz2
 	wget $_PROGRESS_OPT --tries 5 https://github.com/davisking/dlib-models/raw/master/shape_predictor_68_face_landmarks.dat.bz2
+	wget $_PROGRESS_OPT --tries 5 --output-document=arcface_buffalo_l.onnx https://github.com/onnx/models/raw/main/validated/vision/body_analysis/arcface/model/arcfaceresnet100-8.onnx
 
 # Otherwise fall back on curl
 else
@@ -20,6 +21,7 @@ else
 	curl --location --retry 5 --output mmod_human_face_detector.dat.bz2 https://github.com/davisking/dlib-models/raw/master/mmod_human_face_detector.dat.bz2
 	curl --location --retry 5 --output shape_predictor_5_face_landmarks.dat.bz2 https://github.com/davisking/dlib-models/raw/master/shape_predictor_5_face_landmarks.dat.bz2
 	curl --location --retry 5 --output shape_predictor_68_face_landmarks.dat.bz2 https://github.com/davisking/dlib-models/raw/master/shape_predictor_68_face_landmarks.dat.bz2
+	curl --location --retry 5 --output arcface_buffalo_l.onnx https://github.com/onnx/models/raw/main/validated/vision/body_analysis/arcface/model/arcface-resnet100-8.onnx
 fi
 
 # Uncompress the data files and delete the original archive

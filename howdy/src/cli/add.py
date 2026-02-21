@@ -9,7 +9,42 @@ import configparser
 import builtins
 import numpy as np
 import paths_factory
+import onnxruntime as ort
 
+class ArcFaceEncoder:
+	"""Face encoder using ArcFace ONNX model."""
+	
+	def __init__(self, model_path):
+		self.session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
+		self.input_name = self.session.get_inputs()[0].name
+		
+	def preprocess(self, frame, landmarks):
+		"""Align and crop face based on landmarks."""
+		x, y, w, h = landmarks.rect.left(), landmarks.rect.top(), landmarks.rect.width(), landmarks.rect.height()
+		face_img = frame[max(0, y):y+h, max(0, x):x+w]
+		face_img = cv2.resize(face_img, (112, 112))
+		
+		# Normalize
+		face_img = face_img.astype(np.float32)
+		face_img = (face_img / 255.0 - 0.5) / 0.5
+		face_img = np.transpose(face_img, (2, 0, 1))
+		face_img = np.expand_dims(face_img, axis=0)
+		return face_img
+
+	def encode(self, frame, landmarks):
+		"""Generate 512D embedding."""
+		blob = self.preprocess(frame, landmarks)
+		net_out = self.session.run(None, {self.input_name: blob})
+		embeddings = net_out[0]
+		
+		# L2 Normalize
+		norm = np.linalg.norm(embeddings)
+		if norm > 1e-6:
+			embeddings = embeddings / norm
+			
+		return embeddings.flatten()
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from recorders.video_capture import VideoCapture
 from i18n import _
 
@@ -45,7 +80,14 @@ else:
 	face_detector = dlib.get_frontal_face_detector()
 
 pose_predictor = dlib.shape_predictor(paths_factory.shape_predictor_5_face_landmarks_path())
-face_encoder = dlib.face_recognition_model_v1(paths_factory.dlib_face_recognition_resnet_model_v1_path())
+
+# Initialize ArcFace encoder instead of dlib ResNet
+model_path = os.path.join(paths_factory.dlib_data_dir_path(), "arcface_buffalo_l.onnx")
+if not os.path.isfile(model_path):
+	print(_("ArcFace model not found at {}, please download it").format(model_path))
+	sys.exit(1)
+	
+face_encoder = ArcFaceEncoder(model_path)
 
 user = builtins.howdy_user
 # The permanent file to store the encoded model in
@@ -195,7 +237,7 @@ def capture_face_encoding(video_capture, prompt_text, angle_hint=None):
 		face_location = face_location.rect
 	
 	face_landmark = pose_predictor(frame, face_location)
-	face_encoding = np.array(face_encoder.compute_face_descriptor(frame, face_landmark, 1))
+	face_encoding = face_encoder.encode(frame, face_landmark)
 	
 	print(_("Captured {} angle successfully").format(prompt_text))
 	return face_encoding
@@ -264,7 +306,7 @@ else:
 		face_location = face_location.rect
 	
 	face_landmark = pose_predictor(frame, face_location)
-	face_encoding = np.array(face_encoder.compute_face_descriptor(frame, face_landmark, 1))
+	face_encoding = face_encoder.encode(frame, face_landmark)
 	
 	insert_model["data"].append(face_encoding.tolist())
 

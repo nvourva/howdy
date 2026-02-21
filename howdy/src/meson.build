@@ -29,6 +29,8 @@ py_sources = [
     'cli/test.py',
     'cli.py',
     'compare.py',
+    'encoders/__init__.py',
+    'encoders/arcface.py',
     'i18n.py',
     'paths_factory.py',
     'recorders/__init__.py',

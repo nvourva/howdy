@@ -28,6 +28,42 @@ import snapshot
 import numpy as np
 import _thread as thread
 import paths_factory
+import onnxruntime as ort
+
+class ArcFaceEncoder:
+	"""Face encoder using ArcFace ONNX model."""
+	
+	def __init__(self, model_path):
+		self.session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
+		self.input_name = self.session.get_inputs()[0].name
+		
+	def preprocess(self, frame, landmarks):
+		"""Align and crop face based on landmarks."""
+		x, y, w, h = landmarks.rect.left(), landmarks.rect.top(), landmarks.rect.width(), landmarks.rect.height()
+		face_img = frame[max(0, y):y+h, max(0, x):x+w]
+		face_img = cv2.resize(face_img, (112, 112))
+		
+		# Normalize
+		face_img = face_img.astype(np.float32)
+		face_img = (face_img / 255.0 - 0.5) / 0.5
+		face_img = np.transpose(face_img, (2, 0, 1))
+		face_img = np.expand_dims(face_img, axis=0)
+		return face_img
+
+	def encode(self, frame, landmarks):
+		"""Generate 512D embedding."""
+		blob = self.preprocess(frame, landmarks)
+		net_out = self.session.run(None, {self.input_name: blob})
+		embeddings = net_out[0]
+		
+		# L2 Normalize
+		norm = np.linalg.norm(embeddings)
+		if norm > 1e-6:
+			embeddings = embeddings / norm
+			
+		return embeddings.flatten()
+
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from recorders.video_capture import VideoCapture
 from i18n import _
 
@@ -122,35 +158,47 @@ class BlinkDetector:
 		else:
 			ear = (left_ear + right_ear) / 2.0
 		
-		# Build baseline from frames with open eyes (EAR > 0.22 to exclude blinks)
-		if len(self.baseline_samples) < 5:
-			if ear > 0.22:  # Only use "open eye" frames for baseline
+		# Build baseline from frames with open eyes (EAR > 0.18 to exclude blinks)
+		if len(self.baseline_samples) < 3:
+			if ear > 0.18:  # Only use "open eye" frames for baseline
 				self.baseline_samples.append(ear)
-				debug_log.write(f"[{datetime.now()}] Baseline sample {len(self.baseline_samples)}/5: EAR={ear:.3f}\n")
+				debug_log.write(f"[{datetime.now()}] Baseline sample {len(self.baseline_samples)}/3: EAR={ear:.3f}\n")
 				debug_log.flush()
+			
+			# If we don't have enough samples yet, we still want to check for matches
+			# so we don't block the whole loop
 			return self.blink_count, ear
 		
 		if not self.baseline_ready:
 			self.baseline_ear = np.mean(self.baseline_samples)
 			self.baseline_ready = True
-			debug_log.write(f"[{datetime.now()}] Baseline EAR established: {self.baseline_ear:.3f}, threshold: {self.baseline_ear * ear_threshold:.3f}\n")
+			debug_log.write(f"[{datetime.now()}] Baseline EAR established: {self.baseline_ear:.3f}\n")
 			debug_log.flush()
 		
 		# Blink threshold is percentage below baseline (ear_threshold is now a ratio, e.g., 0.7 = 70% of baseline)
 		# If baseline is very low, we use a fixed minimum threshold to avoid impossible targets
 		# Increased minimum threshold to 0.18 to be more sensitive
+		# Based on logs, we need to be even more sensitive if baseline is low
 		blink_threshold = max(0.18, self.baseline_ear * ear_threshold)
+		
+		# If baseline is very low (e.g. 0.22), the threshold might be too close to the baseline
+		# Let's ensure there's at least a 0.03 difference (reduced from 0.05 to be more lenient)
+		blink_threshold = max(blink_threshold, self.baseline_ear - 0.03)
 		
 		# State machine: detect close -> open cycle
 		if ear < blink_threshold:
 			self.closed_frames += 1
 			if self.closed_frames >= 1 and not self.eye_closed:
 				self.eye_closed = True
-				debug_log.write(f"[{datetime.now()}] Eye closed detected (EAR: {ear:.3f})\n")
+				debug_log.write(f"[{datetime.now()}] Eye closed detected (EAR: {ear:.3f}, threshold: {blink_threshold:.3f})\n")
 				debug_log.flush()
-		else:
-			# Eyes reopened
+		
+		# Eyes reopened (or never closed enough)
+		# We check for reopening if we were closed, OR if we are currently above threshold
+		if ear >= blink_threshold:
 			if self.eye_closed:
+				# If EAR is high enough, we count it as a blink
+				# We'll be very lenient here: if it's back above threshold, it's a blink
 				if current_time - self.last_blink_time >= min_blink_interval:
 					self.blink_count += 1
 					self.last_blink_time = current_time
@@ -159,12 +207,20 @@ class BlinkDetector:
 				else:
 					debug_log.write(f"[{datetime.now()}] Blink ignored (too soon: {current_time - self.last_blink_time:.2f}s)\n")
 					debug_log.flush()
+				
+				self.eye_closed = False
+				self.closed_frames = 0
 			
 			# If EAR is high enough, we can reset the state even if we didn't count a blink
 			# This helps if the baseline was bad or if the user's eyes are just naturally wide open
-			if ear > self.baseline_ear * 0.8:
+			# Increased reset threshold to 0.9 * baseline to be more robust
+			if ear > self.baseline_ear * 0.9:
 				self.eye_closed = False
 				self.closed_frames = 0
+		
+		# If we are in the middle of a blink (eyes closed), we still want to check for matches
+		# but we don't return early anymore. We just return the current count.
+		return self.blink_count, ear
 		
 		return self.blink_count, ear
 
@@ -271,7 +327,15 @@ def init_detector(lock):
 
 	# Start the others regardless
 	pose_predictor = dlib.shape_predictor(paths_factory.shape_predictor_5_face_landmarks_path())
-	face_encoder = dlib.face_recognition_model_v1(paths_factory.dlib_face_recognition_resnet_model_v1_path())
+	
+	# Initialize ArcFace encoder instead of dlib ResNet
+	model_path = os.path.join(paths_factory.dlib_data_dir_path(), "arcface_buffalo_l.onnx")
+	if not os.path.isfile(model_path):
+		print(_("ArcFace model not found at {}, please download it").format(model_path))
+		lock.release()
+		exit(1)
+		
+	face_encoder = ArcFaceEncoder(model_path)
 
 	# Load 68-point predictor for liveness detection if available
 	predictor_68_path = paths_factory.shape_predictor_68_face_landmarks_path()
@@ -582,7 +646,7 @@ while True:
 
 		# Fetch the faces in the image
 		face_landmark = pose_predictor(frame, fl)
-		face_encoding = np.array(face_encoder.compute_face_descriptor(frame, face_landmark, 1))
+		face_encoding = face_encoder.encode(frame, face_landmark)
 
 		# Liveness detection via blink detection
 		# Skip liveness check entirely if no blinks required
@@ -607,8 +671,8 @@ while True:
 						debug_log.flush()
 						continue
 
-				debug_log.write(f"[{datetime.now()}] Blinks: {blinks}/{liveness_blinks_required}, EAR: {ear:.3f}\n")
-				debug_log.flush()
+				# debug_log.write(f"[{datetime.now()}] Blinks: {blinks}/{liveness_blinks_required}, EAR: {ear:.3f}\n")
+				# debug_log.flush()
 				
 				# We no longer 'continue' here, we let the face recognition run in parallel
 				# The check for blinks is now moved inside the match confirmation
@@ -629,6 +693,11 @@ while True:
 			lowest_certainty = match
 
 		# Check if a match that's confident enough
+		# ArcFace uses cosine similarity, but we are using Euclidean distance on normalized vectors
+		# For ArcFace, a distance < 1.0 is usually a very strong match
+		debug_log.write(f"[{datetime.now()}] Match distance: {match:.3f}, threshold: {video_certainty:.3f}, blinks: {blinks}/{liveness_blinks_required}\n")
+		debug_log.flush()
+		
 		if 0 < match < video_certainty:
 			# If liveness is enabled, we only proceed if blinks are met
 			if liveness_enabled and liveness_blinks_required > 0:
