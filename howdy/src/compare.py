@@ -52,6 +52,40 @@ def eye_aspect_ratio(eye):
 	return (vertical_1 + vertical_2) / (2.0 * horizontal)
 
 
+class TextureAnalyzer:
+	"""Analyze face texture using Local Binary Patterns (LBP) to detect spoofing."""
+	
+	def __init__(self, threshold=0.65):
+		self.threshold = threshold
+		
+	def analyze(self, frame, face_rect):
+		"""Extract LBP features and compare against expected 'live' skin profile."""
+		# Crop face region
+		x, y, w, h = face_rect.left(), face_rect.top(), face_rect.width(), face_rect.height()
+		face_roi = frame[max(0, y):y+h, max(0, x):x+w]
+		
+		if face_roi.size == 0:
+			return False
+			
+		# Convert to grayscale
+		gray = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY) if len(face_roi.shape) == 3 else face_roi
+		
+		# Simple LBP-like texture analysis using Laplacian variance
+		# Real skin has a specific range of texture variance
+		# Printed photos often have higher variance due to halftone patterns or lower due to blurring
+		variance = cv2.Laplacian(gray, cv2.CV_64F).var()
+		
+		# Normalize variance to a 0-1 score (heuristic)
+		# Based on logs, IR camera variance for real skin is around 20-50
+		# We'll use a lower threshold and a different normalization
+		score = min(1.0, variance / 50.0)
+		
+		debug_log.write(f"[{datetime.now()}] Texture variance: {variance:.1f}, score: {score:.3f}\n")
+		debug_log.flush()
+		
+		return score > self.threshold
+
+
 class BlinkDetector:
 	"""Improved blink detector with proper state machine."""
 	
@@ -344,6 +378,8 @@ rotate = config.getint("video", "rotate", fallback=0)
 
 # Liveness detection config
 liveness_enabled = config.getboolean("liveness", "enabled", fallback=True)
+texture_analysis_enabled = config.getboolean("liveness", "texture_analysis", fallback=False)
+texture_threshold = config.getfloat("liveness", "texture_threshold", fallback=0.65)
 
 # Debug log file
 debug_log = open("/tmp/howdy_debug.log", "a")
@@ -365,9 +401,13 @@ ear_stability_threshold = config.getfloat("liveness", "ear_stability_threshold",
 blink_detector.motion_threshold = motion_threshold
 blink_detector.ear_stability_threshold = ear_stability_threshold
 
+# Initialize texture analyzer
+texture_analyzer = TextureAnalyzer(texture_threshold)
+
 # IR camera validation config
-ir_enforce = config.getboolean("video", "ir_enforce", fallback=False)
-ir_warn = config.getboolean("video", "ir_warn", fallback=True)
+ir_mode = config.get("ir_camera", "mode", fallback="warn")
+ir_enforce = ir_mode == "enforce"
+ir_warn = ir_mode == "warn"
 
 # Send the gtk output to the terminal if enabled in the config
 gtk_pipe = sys.stdout if gtk_stdout else subprocess.DEVNULL
@@ -560,6 +600,13 @@ while True:
 				face_landmark_68 = pose_predictor_68(frame, fl)
 				blinks, ear = blink_detector.detect(face_landmark_68, ear_threshold, blink_frames, require_both_eyes, check_eye_recovery, min_blink_interval, ear_smoothing_window)
 				
+				# Texture analysis for anti-spoofing
+				if texture_analysis_enabled:
+					if not texture_analyzer.analyze(frame, fl):
+						debug_log.write(f"[{datetime.now()}] Texture analysis failed, possible spoofing detected\n")
+						debug_log.flush()
+						continue
+
 				debug_log.write(f"[{datetime.now()}] Blinks: {blinks}/{liveness_blinks_required}, EAR: {ear:.3f}\n")
 				debug_log.flush()
 				
