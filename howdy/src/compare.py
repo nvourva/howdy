@@ -1,6 +1,11 @@
 # Compare incoming video with known faces
 # Running in a local python instance to get around PATH issues
 
+# Debug settings
+DEBUG = True
+import logging
+logger = logging.getLogger(__name__)
+
 # Import time so we can start timing asap
 import time
 
@@ -59,40 +64,18 @@ class BlinkDetector:
 		self.reset()
 	
 	def reset(self):
-		self.state = self.STATE_OPEN
 		self.blink_count = 0
-		self.ear_history = []
-		self.max_ear = 0.3
-		self.min_ear = 0.3
+		self.baseline_ear = None
+		self.baseline_samples = []
+		self.baseline_ready = False
+		self.eye_closed = False
+		self.closed_frames = 0
 		self.last_blink_time = 0
-		self.closed_frame_count = 0
-		self.last_nose_x = None
-		self.last_nose_y = None
-		self.motion_threshold = 5
-		self.prev_ear = None
-		self.ear_stability_threshold = 0.04
 	
 	def detect(self, shape, ear_threshold, blink_frames, require_both_eyes, 
 			   check_eye_recovery, min_blink_interval, ear_smoothing_window):
-		"""Detect blink using state machine for reliability."""
+		"""Blink detection based on percentage drop from baseline EAR."""
 		current_time = time.time()
-		
-		nose_x = shape.part(30).x
-		nose_y = shape.part(30).y
-		
-		if self.last_nose_x is not None:
-			dx = nose_x - self.last_nose_x
-			dy = nose_y - self.last_nose_y
-			motion = (dx * dx + dy * dy) ** 0.5
-			
-			if motion > self.motion_threshold:
-				self.last_nose_x = nose_x
-				self.last_nose_y = nose_y
-				self.state = self.STATE_OPEN
-				return None
-		
-		self.last_nose_x = nose_x
-		self.last_nose_y = nose_y
 		
 		left_eye = np.array([(shape.part(i).x, shape.part(i).y) for i in range(36, 42)])
 		right_eye = np.array([(shape.part(i).x, shape.part(i).y) for i in range(42, 48)])
@@ -105,65 +88,49 @@ class BlinkDetector:
 		else:
 			ear = (left_ear + right_ear) / 2.0
 		
-		if self.prev_ear is not None:
-			ear_delta = abs(ear - self.prev_ear)
-			if ear_delta > self.ear_stability_threshold:
-				self.state = self.STATE_OPEN
-				self.prev_ear = ear
-				return None
-		self.prev_ear = ear
+		# Build baseline from frames with open eyes (EAR > 0.22 to exclude blinks)
+		if len(self.baseline_samples) < 5:
+			if ear > 0.22:  # Only use "open eye" frames for baseline
+				self.baseline_samples.append(ear)
+				debug_log.write(f"[{datetime.now()}] Baseline sample {len(self.baseline_samples)}/5: EAR={ear:.3f}\n")
+				debug_log.flush()
+			return self.blink_count, ear
 		
-		self.ear_history.append(ear)
-		if len(self.ear_history) > max(ear_smoothing_window, 15):
-			self.ear_history.pop(0)
+		if not self.baseline_ready:
+			self.baseline_ear = np.mean(self.baseline_samples)
+			self.baseline_ready = True
+			debug_log.write(f"[{datetime.now()}] Baseline EAR established: {self.baseline_ear:.3f}, threshold: {self.baseline_ear * ear_threshold:.3f}\n")
+			debug_log.flush()
 		
-		if len(self.ear_history) >= ear_smoothing_window:
-			ear = np.median(self.ear_history[-ear_smoothing_window:])
+		# Blink threshold is percentage below baseline (ear_threshold is now a ratio, e.g., 0.7 = 70% of baseline)
+		# If baseline is very low, we use a fixed minimum threshold to avoid impossible targets
+		# Increased minimum threshold to 0.18 to be more sensitive
+		blink_threshold = max(0.18, self.baseline_ear * ear_threshold)
 		
-		self.max_ear = max(self.max_ear * 0.99, ear)
-		self.min_ear = min(self.min_ear * 1.01 + 0.001, ear)
-		
-		closed_threshold = ear_threshold
-		open_threshold = ear_threshold * 1.3
-		
-		if self.state == self.STATE_OPEN:
-			if ear < closed_threshold:
-				self.state = self.STATE_CLOSING
-				self.closed_frame_count = 1
-		
-		elif self.state == self.STATE_CLOSING:
-			if ear >= closed_threshold:
-				if ear < open_threshold:
-					self.closed_frame_count += 1
-			else:
-				self.closed_frame_count += 1
-				if self.closed_frame_count >= blink_frames:
-					self.state = self.STATE_CLOSED
-		
-		elif self.state == self.STATE_CLOSED:
-			if ear >= open_threshold:
-				if check_eye_recovery:
-					if current_time - self.last_blink_time >= min_blink_interval:
-						self.blink_count += 1
-						self.last_blink_time = current_time
-						self.state = self.STATE_OPEN
-						self.closed_frame_count = 0
-						self.max_ear = 0.3
-						self.min_ear = 0.3
+		# State machine: detect close -> open cycle
+		if ear < blink_threshold:
+			self.closed_frames += 1
+			if self.closed_frames >= 1 and not self.eye_closed:
+				self.eye_closed = True
+				debug_log.write(f"[{datetime.now()}] Eye closed detected (EAR: {ear:.3f})\n")
+				debug_log.flush()
+		else:
+			# Eyes reopened
+			if self.eye_closed:
+				if current_time - self.last_blink_time >= min_blink_interval:
+					self.blink_count += 1
+					self.last_blink_time = current_time
+					debug_log.write(f"[{datetime.now()}] Blink counted! Total: {self.blink_count} (EAR: {ear:.3f})\n")
+					debug_log.flush()
 				else:
-					if current_time - self.last_blink_time >= min_blink_interval:
-						self.blink_count += 1
-						self.last_blink_time = current_time
-					self.state = self.STATE_OPEN
-			elif ear < closed_threshold:
-				self.closed_frame_count += 1
-		
-		elif self.state == self.STATE_OPENING:
-			if ear >= open_threshold:
-				self.state = self.STATE_OPEN
-			elif ear < closed_threshold:
-				self.state = self.STATE_CLOSING
-				self.closed_frame_count = 1
+					debug_log.write(f"[{datetime.now()}] Blink ignored (too soon: {current_time - self.last_blink_time:.2f}s)\n")
+					debug_log.flush()
+			
+			# If EAR is high enough, we can reset the state even if we didn't count a blink
+			# This helps if the baseline was bad or if the user's eyes are just naturally wide open
+			if ear > self.baseline_ear * 0.8:
+				self.eye_closed = False
+				self.closed_frames = 0
 		
 		return self.blink_count, ear
 
@@ -339,6 +306,7 @@ pose_predictor_68 = None
 face_encoder = None
 
 # Liveness detection state
+blinks = 0
 blink_counter = 0
 blink_state = False
 ear_history = []
@@ -376,6 +344,12 @@ rotate = config.getint("video", "rotate", fallback=0)
 
 # Liveness detection config
 liveness_enabled = config.getboolean("liveness", "enabled", fallback=True)
+
+# Debug log file
+debug_log = open("/tmp/howdy_debug.log", "a")
+debug_log.write(f"[{datetime.now()}] Starting compare.py, liveness_enabled={liveness_enabled}\n")
+debug_log.flush()
+
 liveness_blinks_required = config.getint("liveness", "required_blinks", fallback=1)
 liveness_timeout = config.getfloat("liveness", "liveness_timeout", fallback=3.0)
 ear_threshold = config.getfloat("liveness", "ear_threshold", fallback=0.18)
@@ -571,28 +545,29 @@ while True:
 		face_encoding = np.array(face_encoder.compute_face_descriptor(frame, face_landmark, 1))
 
 		# Liveness detection via blink detection
-		if liveness_enabled and pose_predictor_68 is not None:
-			if liveness_start_time is None:
-				liveness_start_time = time.time()
-			
-			face_landmark_68 = pose_predictor_68(frame, fl)
-			result = blink_detector.detect(face_landmark_68, ear_threshold, blink_frames, require_both_eyes, check_eye_recovery, min_blink_interval, ear_smoothing_window)
-			
-			if result is None:
-				continue
-			
-			blinks, ear = result
-			
-			liveness_elapsed = time.time() - liveness_start_time
-			
-			if liveness_elapsed > liveness_timeout:
+		# Skip liveness check entirely if no blinks required
+		if liveness_enabled and liveness_blinks_required > 0 and pose_predictor_68 is not None:
+			try:
+				if liveness_start_time is None:
+					liveness_start_time = time.time()
+				
+				liveness_elapsed = time.time() - liveness_start_time
+				if liveness_elapsed > liveness_timeout:
+					if end_report:
+						print(_("Liveness check timeout after {:.1f}s").format(liveness_elapsed))
+					exit(15)
+				
+				face_landmark_68 = pose_predictor_68(frame, fl)
+				blinks, ear = blink_detector.detect(face_landmark_68, ear_threshold, blink_frames, require_both_eyes, check_eye_recovery, min_blink_interval, ear_smoothing_window)
+				
+				debug_log.write(f"[{datetime.now()}] Blinks: {blinks}/{liveness_blinks_required}, EAR: {ear:.3f}\n")
+				debug_log.flush()
+				
+				# We no longer 'continue' here, we let the face recognition run in parallel
+				# The check for blinks is now moved inside the match confirmation
+			except Exception as e:
 				if end_report:
-					print(_("Liveness check timeout after {:.1f}s, {} blinks detected").format(liveness_elapsed, blinks))
-				exit(15)
-			
-			if blinks < liveness_blinks_required:
-				if end_report and frames % 10 == 0:
-					print(_("Liveness check: {} blinks detected, {} required").format(blinks, liveness_blinks_required))
+					print(_("Liveness detection error: {}").format(e))
 				continue
 
 		# Match this found face against a known face
@@ -608,6 +583,11 @@ while True:
 
 		# Check if a match that's confident enough
 		if 0 < match < video_certainty:
+			# If liveness is enabled, we only proceed if blinks are met
+			if liveness_enabled and liveness_blinks_required > 0:
+				if blinks < liveness_blinks_required:
+					continue
+
 			timings["tt"] = time.time() - timings["st"]
 			timings["fl"] = time.time() - timings["fr"]
 
