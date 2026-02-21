@@ -47,29 +47,184 @@ def eye_aspect_ratio(eye):
 	return (vertical_1 + vertical_2) / (2.0 * horizontal)
 
 
-def detect_blink(shape):
-	"""Detect blink using 68-point facial landmarks."""
-	global blink_counter, blink_state, ear_history
+class BlinkDetector:
+	"""Improved blink detector with proper state machine."""
 	
-	left_eye = np.array([(shape.part(i).x, shape.part(i).y) for i in range(36, 42)])
-	right_eye = np.array([(shape.part(i).x, shape.part(i).y) for i in range(42, 48)])
+	STATE_OPEN = 0
+	STATE_CLOSING = 1
+	STATE_CLOSED = 2
+	STATE_OPENING = 3
 	
-	left_ear = eye_aspect_ratio(left_eye)
-	right_ear = eye_aspect_ratio(right_eye)
-	ear = (left_ear + right_ear) / 2.0
+	def __init__(self):
+		self.reset()
 	
-	ear_history.append(ear)
-	if len(ear_history) > 10:
-		ear_history.pop(0)
+	def reset(self):
+		self.state = self.STATE_OPEN
+		self.blink_count = 0
+		self.ear_history = []
+		self.max_ear = 0.3
+		self.min_ear = 0.3
+		self.last_blink_time = 0
+		self.closed_frame_count = 0
+		self.last_nose_x = None
+		self.last_nose_y = None
+		self.motion_threshold = 5
+		self.prev_ear = None
+		self.ear_stability_threshold = 0.04
 	
-	if ear < EYE_AR_THRESH:
-		if not blink_state:
-			blink_state = True
-			blink_counter += 1
-	else:
-		blink_state = False
+	def detect(self, shape, ear_threshold, blink_frames, require_both_eyes, 
+			   check_eye_recovery, min_blink_interval, ear_smoothing_window):
+		"""Detect blink using state machine for reliability."""
+		current_time = time.time()
+		
+		nose_x = shape.part(30).x
+		nose_y = shape.part(30).y
+		
+		if self.last_nose_x is not None:
+			dx = nose_x - self.last_nose_x
+			dy = nose_y - self.last_nose_y
+			motion = (dx * dx + dy * dy) ** 0.5
+			
+			if motion > self.motion_threshold:
+				self.last_nose_x = nose_x
+				self.last_nose_y = nose_y
+				self.state = self.STATE_OPEN
+				return None
+		
+		self.last_nose_x = nose_x
+		self.last_nose_y = nose_y
+		
+		left_eye = np.array([(shape.part(i).x, shape.part(i).y) for i in range(36, 42)])
+		right_eye = np.array([(shape.part(i).x, shape.part(i).y) for i in range(42, 48)])
+		
+		left_ear = eye_aspect_ratio(left_eye)
+		right_ear = eye_aspect_ratio(right_eye)
+		
+		if require_both_eyes:
+			ear = min(left_ear, right_ear)
+		else:
+			ear = (left_ear + right_ear) / 2.0
+		
+		if self.prev_ear is not None:
+			ear_delta = abs(ear - self.prev_ear)
+			if ear_delta > self.ear_stability_threshold:
+				self.state = self.STATE_OPEN
+				self.prev_ear = ear
+				return None
+		self.prev_ear = ear
+		
+		self.ear_history.append(ear)
+		if len(self.ear_history) > max(ear_smoothing_window, 15):
+			self.ear_history.pop(0)
+		
+		if len(self.ear_history) >= ear_smoothing_window:
+			ear = np.median(self.ear_history[-ear_smoothing_window:])
+		
+		self.max_ear = max(self.max_ear * 0.99, ear)
+		self.min_ear = min(self.min_ear * 1.01 + 0.001, ear)
+		
+		closed_threshold = ear_threshold
+		open_threshold = ear_threshold * 1.3
+		
+		if self.state == self.STATE_OPEN:
+			if ear < closed_threshold:
+				self.state = self.STATE_CLOSING
+				self.closed_frame_count = 1
+		
+		elif self.state == self.STATE_CLOSING:
+			if ear >= closed_threshold:
+				if ear < open_threshold:
+					self.closed_frame_count += 1
+			else:
+				self.closed_frame_count += 1
+				if self.closed_frame_count >= blink_frames:
+					self.state = self.STATE_CLOSED
+		
+		elif self.state == self.STATE_CLOSED:
+			if ear >= open_threshold:
+				if check_eye_recovery:
+					if current_time - self.last_blink_time >= min_blink_interval:
+						self.blink_count += 1
+						self.last_blink_time = current_time
+						self.state = self.STATE_OPEN
+						self.closed_frame_count = 0
+						self.max_ear = 0.3
+						self.min_ear = 0.3
+				else:
+					if current_time - self.last_blink_time >= min_blink_interval:
+						self.blink_count += 1
+						self.last_blink_time = current_time
+					self.state = self.STATE_OPEN
+			elif ear < closed_threshold:
+				self.closed_frame_count += 1
+		
+		elif self.state == self.STATE_OPENING:
+			if ear >= open_threshold:
+				self.state = self.STATE_OPEN
+			elif ear < closed_threshold:
+				self.state = self.STATE_CLOSING
+				self.closed_frame_count = 1
+		
+		return self.blink_count, ear
+
+
+blink_detector = BlinkDetector()
+
+
+def get_head_pose(shape, frame_width, frame_height):
+	"""Detect head pose direction using facial landmarks."""
+	nose = np.array([shape.part(30).x, shape.part(30).y])
+	left_eye_center = np.array([(shape.part(36).x + shape.part(39).x) / 2,
+							   (shape.part(36).y + shape.part(39).y) / 2])
+	right_eye_center = np.array([(shape.part(42).x + shape.part(45).x) / 2,
+								 (shape.part(42).y + shape.part(45).y) / 2])
 	
-	return blink_counter, ear
+	eye_distance = np.linalg.norm(left_eye_center - right_eye_center)
+	eye_center = (left_eye_center + right_eye_center) / 2
+	
+	horizontal_offset = (nose[0] - eye_center[0]) / eye_distance
+	vertical_offset = (nose[1] - eye_center[1]) / eye_distance
+	
+	mouth_center = np.array([(shape.part(62).x + shape.part(66).x) / 2,
+							(shape.part(62).y + shape.part(66).y) / 2])
+	nose_to_mouth = nose[1] - mouth_center[1]
+	
+	return {
+		"horizontal": horizontal_offset,
+		"vertical": vertical_offset,
+		"nose_to_mouth": nose_to_mouth / eye_distance
+	}
+
+
+def detect_smile(shape):
+	"""Detect smile using mouth landmarks."""
+	mouth_left = np.array([shape.part(60).x, shape.part(60).y])
+	mouth_right = np.array([shape.part(64).x, shape.part(64).y])
+	mouth_top = np.array([shape.part(62).x, shape.part(62).y])
+	mouth_bottom = np.array([shape.part(66).x, shape.part(66).y])
+	
+	mouth_width = np.linalg.norm(mouth_right - mouth_left)
+	mouth_height = np.linalg.norm(mouth_bottom - mouth_top)
+	
+	smile_ratio = mouth_width / (mouth_height + 0.1)
+	
+	return smile_ratio > 3.5
+
+
+def get_challenge_direction(pose):
+	"""Determine which direction the user is looking based on head pose."""
+	h = pose["horizontal"]
+	v = pose["vertical"]
+	
+	if h < -0.3:
+		return "left"
+	elif h > 0.3:
+		return "right"
+	elif v < -0.25:
+		return "up"
+	elif v > 0.25:
+		return "down"
+	return "center"
 
 
 def detect_ir_camera(video_capture):
@@ -187,8 +342,9 @@ face_encoder = None
 blink_counter = 0
 blink_state = False
 ear_history = []
-EYE_AR_THRESH = 0.2
-EYE_AR_CONSEC_FRAMES = 3
+liveness_start_time = None
+consecutive_low_ear_frames = 0
+last_blink_time = 0
 
 # Try to load the face model from the models folder
 try:
@@ -220,8 +376,20 @@ rotate = config.getint("video", "rotate", fallback=0)
 
 # Liveness detection config
 liveness_enabled = config.getboolean("liveness", "enabled", fallback=True)
-liveness_blinks_required = config.getint("liveness", "blinks_required", fallback=1)
-liveness_timeout = config.getfloat("liveness", "timeout", fallback=2.0)
+liveness_blinks_required = config.getint("liveness", "required_blinks", fallback=1)
+liveness_timeout = config.getfloat("liveness", "liveness_timeout", fallback=3.0)
+ear_threshold = config.getfloat("liveness", "ear_threshold", fallback=0.18)
+blink_frames = config.getint("liveness", "blink_frames", fallback=4)
+require_both_eyes = config.getboolean("liveness", "require_both_eyes", fallback=True)
+check_eye_recovery = config.getboolean("liveness", "check_eye_recovery", fallback=True)
+min_blink_interval = config.getfloat("liveness", "min_blink_interval", fallback=0.5)
+ear_smoothing_window = config.getint("liveness", "ear_smoothing_window", fallback=5)
+motion_threshold = config.getint("liveness", "motion_threshold", fallback=3)
+ear_stability_threshold = config.getfloat("liveness", "ear_stability_threshold", fallback=0.03)
+
+# Initialize blink detector with config
+blink_detector.motion_threshold = motion_threshold
+blink_detector.ear_stability_threshold = ear_stability_threshold
 
 # IR camera validation config
 ir_enforce = config.getboolean("video", "ir_enforce", fallback=False)
@@ -404,8 +572,23 @@ while True:
 
 		# Liveness detection via blink detection
 		if liveness_enabled and pose_predictor_68 is not None:
+			if liveness_start_time is None:
+				liveness_start_time = time.time()
+			
 			face_landmark_68 = pose_predictor_68(frame, fl)
-			blinks, ear = detect_blink(face_landmark_68)
+			result = blink_detector.detect(face_landmark_68, ear_threshold, blink_frames, require_both_eyes, check_eye_recovery, min_blink_interval, ear_smoothing_window)
+			
+			if result is None:
+				continue
+			
+			blinks, ear = result
+			
+			liveness_elapsed = time.time() - liveness_start_time
+			
+			if liveness_elapsed > liveness_timeout:
+				if end_report:
+					print(_("Liveness check timeout after {:.1f}s, {} blinks detected").format(liveness_elapsed, blinks))
+				exit(15)
 			
 			if blinks < liveness_blinks_required:
 				if end_report and frames % 10 == 0:

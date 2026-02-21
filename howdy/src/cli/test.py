@@ -65,6 +65,29 @@ else:
 pose_predictor = dlib.shape_predictor(paths_factory.shape_predictor_5_face_landmarks_path())
 face_encoder = dlib.face_recognition_model_v1(paths_factory.dlib_face_recognition_resnet_model_v1_path())
 
+liveness_enabled = config.getboolean("liveness_detection", "enabled", fallback=True)
+liveness_timeout = config.getint("liveness_detection", "timeout", fallback=5)
+ear_threshold = config.getfloat("liveness_detection", "ear_threshold", fallback=0.25)
+blink_frames_required = config.getint("liveness_detection", "blink_frames", fallback=2)
+
+pose_predictor_68 = None
+if liveness_enabled:
+	try:
+		pose_predictor_68 = dlib.shape_predictor(paths_factory.shape_predictor_68_face_landmarks_path())
+	except RuntimeError:
+		print(_("WARNING: 68-point landmark model not found, liveness detection disabled"))
+		liveness_enabled = False
+
+
+def calculate_ear(eye_points):
+	"""Calculate Eye Aspect Ratio for blink detection."""
+	v1 = np.linalg.norm(eye_points[1] - eye_points[5])
+	v2 = np.linalg.norm(eye_points[2] - eye_points[4])
+	h = np.linalg.norm(eye_points[0] - eye_points[3])
+	if h == 0:
+		return 1.0
+	return (v1 + v2) / (2.0 * h)
+
 encodings = []
 encoding_to_model = []
 models = None
@@ -98,6 +121,12 @@ fps = 0
 sec = int(time.time())
 # recognition time
 rec_tm = 0
+
+# Liveness detection state
+blink_count = 0
+liveness_start_time = None
+consecutive_blinks = 0
+timeout_warning_frames = 0
 
 # Wrap everything in an keyboard interrupt handler
 try:
@@ -152,6 +181,25 @@ try:
 		print_text(1, _("FPS: %d") % (fps, ))
 		print_text(2, _("FRAMES: %d") % (total_frames, ))
 		print_text(3, _("RECOGNITION: %dms") % (round(rec_tm * 1000), ))
+		if liveness_enabled:
+			print_text(4, _("BLINKS: %d/%d") % (blink_count, blink_frames_required))
+			if liveness_start_time:
+				elapsed = int(time.time() - liveness_start_time)
+				remaining = max(0, liveness_timeout - elapsed)
+				print_text(5, _("TIMEOUT: %ds") % (remaining, ))
+
+				# Check for timeout and show warning
+				if remaining == 0 and blink_count < blink_frames_required:
+					if timeout_warning_frames == 0:
+						blink_count = 0
+						liveness_start_time = None
+					timeout_warning_frames = 30  # Show warning for 30 frames
+			else:
+				timeout_warning_frames = max(0, timeout_warning_frames - 1)
+
+		# Show liveness timeout warning
+		if liveness_enabled and timeout_warning_frames > 0:
+			cv2.putText(overlay, _("LIVENESS TIMEOUT"), (width // 2 - 60, height // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2, cv2.LINE_AA)
 
 		# Show that slow mode is on, if it's on
 		if slow_mode:
@@ -211,6 +259,31 @@ try:
 						model_idx = encoding_to_model[match_index]
 						circle_text = "{} (certainty: {})".format(models[model_idx]["label"], round(match * 10, 3))
 						cv2.putText(overlay, circle_text, (int(x + r / 3), y - r), cv2.FONT_HERSHEY_SIMPLEX, .3, (0, 255, 0), 0, cv2.LINE_AA)
+
+						# Liveness detection with blink checking
+						if liveness_enabled and pose_predictor_68 is not None:
+							if liveness_start_time is None:
+								liveness_start_time = time.time()
+
+							# Get 68-point landmarks for eye tracking
+							landmarks_68 = pose_predictor_68(orig_frame, loc)
+
+							# Extract eye coordinates (left eye: 36-41, right eye: 42-47)
+							left_eye = np.array([[landmarks_68.part(i).x, landmarks_68.part(i).y] for i in range(36, 42)])
+							right_eye = np.array([[landmarks_68.part(i).x, landmarks_68.part(i).y] for i in range(42, 48)])
+
+							# Calculate Eye Aspect Ratio for both eyes
+							left_ear = calculate_ear(left_eye)
+							right_ear = calculate_ear(right_eye)
+							avg_ear = (left_ear + right_ear) / 2.0
+
+							# Detect blink (EAR below threshold)
+							if avg_ear < ear_threshold:
+								consecutive_blinks += 1
+							else:
+								if consecutive_blinks >= blink_frames_required:
+									blink_count += 1
+								consecutive_blinks = 0
 					# If no approved matches, show red text
 					else:
 						cv2.putText(overlay, "no match", (int(x + r / 3), y - r), cv2.FONT_HERSHEY_SIMPLEX, .3, (0, 0, 255), 0, cv2.LINE_AA)
