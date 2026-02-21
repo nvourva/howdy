@@ -66,13 +66,16 @@ pose_predictor = dlib.shape_predictor(paths_factory.shape_predictor_5_face_landm
 face_encoder = dlib.face_recognition_model_v1(paths_factory.dlib_face_recognition_resnet_model_v1_path())
 
 encodings = []
+encoding_to_model = []
 models = None
 
 try:
 	user = builtins.howdy_user
 	models = json.load(open(paths_factory.user_model_path(user)))
 
-	for model in models:
+	for model_idx, model in enumerate(models):
+		for _enc in model["data"]:
+			encoding_to_model.append(model_idx)
 		encodings += model["data"]
 except FileNotFoundError:
 	pass
@@ -205,7 +208,8 @@ try:
 						color = (0, 230, 0)
 
 						# Print the name of the model next to the circle
-						circle_text = "{} (certainty: {})".format(models[match_index]["label"], round(match * 10, 3))
+						model_idx = encoding_to_model[match_index]
+						circle_text = "{} (certainty: {})".format(models[model_idx]["label"], round(match * 10, 3))
 						cv2.putText(overlay, circle_text, (int(x + r / 3), y - r), cv2.FONT_HERSHEY_SIMPLEX, .3, (0, 255, 0), 0, cv2.LINE_AA)
 					# If no approved matches, show red text
 					else:
