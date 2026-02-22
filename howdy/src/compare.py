@@ -208,13 +208,14 @@ class BlinkDetector:
 					debug_log.write(f"[{datetime.now()}] Blink ignored (too soon: {current_time - self.last_blink_time:.2f}s)\n")
 					debug_log.flush()
 				
+				# ALWAYS reset state when we are above threshold, regardless of whether we counted a blink
 				self.eye_closed = False
 				self.closed_frames = 0
 			
 			# If EAR is high enough, we can reset the state even if we didn't count a blink
 			# This helps if the baseline was bad or if the user's eyes are just naturally wide open
-			# Increased reset threshold to 0.9 * baseline to be more robust
-			if ear > self.baseline_ear * 0.9:
+			# Increased reset threshold to 0.85 * baseline to be more robust
+			if ear > self.baseline_ear * 0.85:
 				self.eye_closed = False
 				self.closed_frames = 0
 		
